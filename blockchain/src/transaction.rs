@@ -23,12 +23,54 @@
 
 use crate::error::*;
 use crate::output::*;
+use crate::SlashingProof;
 use failure::Error;
 use stegos_crypto::curve1174::{
     sign_hash, sign_hash_with_kval, ECp, Fr, PublicKey, SchnorrSig, SecretKey,
 };
 use stegos_crypto::hash::{Hash, Hashable, Hasher};
 use stegos_crypto::pbc;
+
+//--------------------------------------------------------------------------------------------------
+// Slashing Transaction.
+//--------------------------------------------------------------------------------------------------
+
+/// Transaction that confiscate stake from cheater.
+#[derive(Debug, Clone)]
+pub struct SlashingTransaction {
+    pub proof: SlashingProof,
+
+    pub leader: pbc::PublicKey,
+    /// List of inputs.
+    pub txins: Vec<Hash>,
+    /// List of outputs.
+    pub txouts: Vec<Output>,
+}
+
+impl Hashable for SlashingTransaction {
+    fn hash(&self, state: &mut Hasher) {
+        self.proof.hash(state);
+
+        let txins_count: u64 = self.txins.len() as u64;
+        txins_count.hash(state);
+        for txin_hash in &self.txins {
+            txin_hash.hash(state);
+        }
+        // Sign txouts.
+        let txouts_count: u64 = self.txouts.len() as u64;
+        txouts_count.hash(state);
+        for txout in &self.txouts {
+            txout.hash(state);
+        }
+    }
+}
+
+impl SlashingTransaction {
+    pub fn cheater(&self) -> pbc::PublicKey {
+        assert_eq!(self.proof.block1.pkey, self.proof.block2.pkey);
+        self.proof.block1.pkey
+    }
+}
 
 //--------------------------------------------------------------------------------------------------
 // Payment Transaction.
@@ -433,6 +475,7 @@ impl RestakeTransaction {
 pub enum Transaction {
     PaymentTransaction(PaymentTransaction),
     RestakeTransaction(RestakeTransaction),
+    SlashingTransaction(SlashingTransaction),
 }
 
 impl Transaction {
@@ -441,6 +484,7 @@ impl Transaction {
         match self {
             Transaction::PaymentTransaction(tx) => tx.fee,
             Transaction::RestakeTransaction(_tx) => 0,
+            Transaction::SlashingTransaction(_tx) => 0,
         }
     }
 
@@ -449,6 +493,7 @@ impl Transaction {
         match self {
             Transaction::PaymentTransaction(tx) => &tx.txins,
             Transaction::RestakeTransaction(tx) => &tx.txins,
+            Transaction::SlashingTransaction(tx) => &tx.txins,
         }
     }
 
@@ -457,6 +502,7 @@ impl Transaction {
         match self {
             Transaction::PaymentTransaction(tx) => &tx.txouts,
             Transaction::RestakeTransaction(tx) => &tx.txouts,
+            Transaction::SlashingTransaction(tx) => &tx.txouts,
         }
     }
 }
@@ -466,6 +512,7 @@ impl Hashable for Transaction {
         match self {
             Transaction::PaymentTransaction(tx) => tx.hash(state),
             Transaction::RestakeTransaction(tx) => tx.hash(state),
+            Transaction::SlashingTransaction(tx) => tx.hash(state),
         }
     }
 }
@@ -479,5 +526,10 @@ impl From<PaymentTransaction> for Transaction {
 impl From<RestakeTransaction> for Transaction {
     fn from(tx: RestakeTransaction) -> Transaction {
         Transaction::RestakeTransaction(tx)
+    }
+}
+impl From<SlashingTransaction> for Transaction {
+    fn from(tx: SlashingTransaction) -> Self {
+        Transaction::SlashingTransaction(tx)
     }
 }

@@ -70,7 +70,7 @@ pub enum OutputError {
 }
 
 /// Payment UTXO.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PaymentOutput {
     /// Cloaked public key of recipient.
     pub recipient: PublicKey,
@@ -94,7 +94,7 @@ pub struct PaymentOutput {
 }
 
 /// PublicPayment UTXO.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct PublicPaymentOutput {
     /// Uncloaked public key of recipient.
     pub recipient: PublicKey,
@@ -107,7 +107,7 @@ pub struct PublicPaymentOutput {
 }
 
 /// Stake UTXO.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct StakeOutput {
     /// Uncloaked wallet key of validator.
     pub recipient: PublicKey,
@@ -126,7 +126,7 @@ pub struct StakeOutput {
 }
 
 /// Blockchain UTXO.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub enum Output {
     PaymentOutput(PaymentOutput),
     PublicPaymentOutput(PublicPaymentOutput),
@@ -566,6 +566,24 @@ impl Output {
             Output::PublicPaymentOutput(o) => o.is_my_utxo(&pkey),
             Output::StakeOutput(o) => o.is_my_utxo(&pkey),
         }
+    }
+}
+
+impl From<PaymentOutput> for Output {
+    fn from(output: PaymentOutput) -> Output {
+        Output::PaymentOutput(output)
+    }
+}
+
+impl From<StakeOutput> for Output {
+    fn from(output: StakeOutput) -> Output {
+        Output::StakeOutput(output)
+    }
+}
+
+impl From<PublicPaymentOutput> for Output {
+    fn from(output: PublicPaymentOutput) -> Output {
+        Output::PublicPaymentOutput(output)
     }
 }
 

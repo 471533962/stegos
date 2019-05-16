@@ -123,6 +123,7 @@ type BlockByHashMap = MultiVersionedMap<Hash, u64, u64>;
 type OutputByHashMap = MultiVersionedMap<Hash, OutputKey, u64>;
 type BalanceMap = MultiVersionedMap<(), Balance, u64>;
 
+
 /// The blockchain database.
 pub struct Blockchain {
     //
@@ -581,6 +582,15 @@ impl Blockchain {
         self.escrow.get(validator_pkey, self.epoch)
     }
 
+    ///
+    /// Get staked value for validator.
+    ///
+    /// Returns (active_balance, expired_balance) stake.
+    ///
+    #[inline]
+    pub(crate) fn get_utxos(&self, validator_pkey: &pbc::PublicKey) -> (Vec<Hash>, i64) {
+        self.escrow.get_utxos(validator_pkey, self.epoch)
+    }
     /// Return information about escrow.
     #[inline]
     pub fn escrow_info(&self) -> EscrowInfo {
@@ -625,8 +635,43 @@ impl Blockchain {
         self.view_change_proof = None;
     }
 
+    ///
+    /// Check if some of validator was caught on cheating in current epoch.
+    /// Returns proof of cheating.
+    ///
+    pub fn validator_wallet(&self, peer: &pbc::PublicKey) -> Option<&PublicKey> {
+        self.escrow.validators_wallets.get(peer)
+    }
+
     pub fn election_result(&self) -> ElectionResult {
         self.election_result.clone()
+    }
+
+    /// Return election result, for specific moment of history, in past.
+    pub fn election_result_by_height(
+        &self,
+        height: u64,
+    ) -> Result<ElectionResult, BlockchainError> {
+        if height <= self.last_macro_block_height() {
+            return Err(BlockError::ElectionResultForPastEpoch(
+                height,
+                self.last_macro_block_height(),
+            )
+            .into());
+        }
+
+        if height >= self.height() {
+            return Err(BlockError::ElectionResultForFutureBlock(height, self.height()).into());
+        }
+
+        // TODO: for first epoch we can't receive block with height < 1
+        if height <= 1 {
+            return Err(BlockError::ElectionResultForGenesis(height).into());
+        }
+        let mut election = self.election_result();
+        let block = self.block_by_height(height - 1)?;
+        election.random = block.base_header().random;
+        Ok(election)
     }
 
     //----------------------------------------------------------------------------------------------
@@ -875,6 +920,7 @@ impl Blockchain {
                     self.escrow.stake(
                         version,
                         o.validator,
+                        o.recipient,
                         output_hash,
                         self.epoch,
                         self.cfg.stake_epochs,
@@ -986,6 +1032,12 @@ impl Blockchain {
                     gamma += tx.gamma;
                 }
                 Transaction::RestakeTransaction(_tx) => {}
+                Transaction::SlashingTransaction(tx) => {
+                    let validators = std::mem::replace(&mut self.election_result.validators, Vec::new());
+                    // remove cheater for current epoch.
+                    self.election_result.validators = validators.into_iter()
+                            .filter(|(k,_)| k != &tx.cheater()).collect();
+                }
             }
         }
 

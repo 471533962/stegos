@@ -164,16 +164,33 @@ impl Mempool {
         view_change: u32,
         view_change_proof: Option<ViewChangeProof>,
         max_utxo_in_block: usize,
+        cheating_proofs: HashMap<pbc::PublicKey, SlashingTransaction>,
     ) -> MicroBlock {
         let timestamp = SystemTime::now();
         let seed = mix(last_random, view_change);
         let random = pbc::make_VRF(&keychain.network_skey, &seed);
 
+        debug!(
+            "Processing {} slashing transactions.",
+            cheating_proofs.len()
+        );
+
+        let mut transactions: Vec<Transaction> = Vec::new();
+        let mut utxo_in_block: usize = 2;
+        for (_cheater, tx) in cheating_proofs {
+            // Check the maximum number of UTXO in block.
+            if utxo_in_block + tx.txins.len() + tx.txouts.len() >= max_utxo_in_block {
+                break;
+            }
+
+            let tx: Transaction = tx.into();
+            utxo_in_block += tx.txins().len();
+            utxo_in_block += tx.txouts().len();
+            transactions.push(tx);
+        }
         //
         // Transactions.
         //
-        let mut utxo_in_block: usize = 2;
-        let mut transactions: Vec<Transaction> = Vec::new();
         for entry in self.pool.entries() {
             let tx_hash = entry.key();
             let tx = entry.get();
@@ -361,6 +378,7 @@ mod test {
             view_change,
             None,
             max_utxo_in_block,
+            HashMap::new(),
         );
 
         // Used transactions - tx3 is not used because of max_utxo_in_block.

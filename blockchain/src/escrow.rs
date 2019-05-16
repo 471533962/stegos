@@ -30,6 +30,7 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use stegos_crypto::hash::Hash;
 use stegos_crypto::pbc;
+use stegos_crypto::curve1174::PublicKey;
 
 #[derive(Debug, Clone, PartialEq, Eq, Ord, PartialOrd)]
 struct EscrowKey {
@@ -43,12 +44,14 @@ struct EscrowValue {
     amount: i64,
 }
 
+type ValidatorsWallets = MultiVersionedMap<pbc::PublicKey, PublicKey, u64>;
 type EscrowMap = MultiVersionedMap<EscrowKey, EscrowValue, u64>;
 
 #[derive(Debug, Clone)]
 pub struct Escrow {
     /// Stakes.
     escrow: EscrowMap,
+    pub validators_wallets: ValidatorsWallets,
 }
 
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -77,7 +80,8 @@ impl Escrow {
     /// Create a new escrow.
     pub fn new() -> Self {
         let set = EscrowMap::new();
-        Escrow { escrow: set }
+        let validators_wallets: ValidatorsWallets = ValidatorsWallets::new();
+        Escrow { escrow: set, validators_wallets }
     }
 
     ///
@@ -87,6 +91,7 @@ impl Escrow {
         &mut self,
         version: u64,
         validator_pkey: pbc::PublicKey,
+        wallet_pkey: PublicKey,
         output_hash: Hash,
         epoch: u64,
         stakes_epoch: u64,
@@ -108,6 +113,11 @@ impl Escrow {
                 &validator_pkey, &output_hash, v.amount
             );
         }
+
+        if let Some(v) = self.validators_wallets.insert(version, validator_pkey, wallet_pkey) {
+            assert_eq!(v, wallet_pkey, "Found different wallet key, for staker");
+        }
+
 
         let (active_balance, expired_balance) = self.get(&validator_pkey, epoch);
         info!(
@@ -137,6 +147,9 @@ impl Escrow {
             "Unstaked: utxo={}, validator={}, amount={}, active_balance={}, expired_balance={}",
             output_hash, validator_pkey, val.amount, active_balance, expired_balance
         );
+        if active_balance == 0 && expired_balance == 0 {
+            self.validators_wallets.remove(version, &validator_pkey).expect("wallet exist");
+        }
     }
 
     ///
@@ -167,6 +180,33 @@ impl Escrow {
         }
 
         (active_balance, expired_balance)
+    }
+
+    ///
+    /// Returns list of utxos for specific validator.
+    ///
+    pub fn get_utxos(&self, validator_pkey: &pbc::PublicKey, epoch: u64) -> (Vec<Hash>, i64) {
+        let (hash_min, hash_max) = Hash::bounds();
+        let key_min = EscrowKey {
+            validator_pkey: validator_pkey.clone(),
+            output_hash: hash_min,
+        };
+        let key_max = EscrowKey {
+            validator_pkey: validator_pkey.clone(),
+            output_hash: hash_max,
+        };
+
+        let mut result = Vec::new();
+        let mut stake = 0;
+        for (key, value) in self.escrow.range(&key_min..=&key_max) {
+            assert_eq!(&key.validator_pkey, validator_pkey);
+            if value.active_until_epoch >= epoch {
+                stake += value.amount;
+                result.push(key.output_hash)
+            }
+        }
+
+        (result, stake)
     }
 
     ///
@@ -234,10 +274,12 @@ impl Escrow {
     #[inline]
     pub fn checkpoint(&mut self) {
         self.escrow.checkpoint();
+        self.escrow.checkpoint();
     }
 
     #[inline]
     pub fn rollback_to_version(&mut self, to_version: u64) {
         self.escrow.rollback_to_version(to_version);
+        self.validators_wallets.rollback_to_version(to_version);
     }
 }

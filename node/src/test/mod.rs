@@ -186,6 +186,10 @@ impl<'p> PartitionGuard<'p> {
     pub fn wait(&mut self, duration: Duration) {
         wait(&mut *self.timer, duration)
     }
+
+    pub fn cfg(&self) -> &ChainConfig {
+        &self.config
+    }
 }
 
 struct NodeSandbox {

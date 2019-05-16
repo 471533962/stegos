@@ -693,6 +693,92 @@ fn micro_block_without_signature() {
     });
 }
 
+// CASE partition:
+// Nodes [A, B, C, D]
+//
+// 1. Node A leader cheater and create multiple blocks (B1, B2).
+// 2. Nodes [B, C, D] receive B1 and B2, and punish node A.
+//
+// Asserts that in [A] no more validator.
+
+#[test]
+fn slash_cheater() {
+    let mut cfg: ChainConfig = Default::default();
+    cfg.blocks_in_epoch = 2000;
+    let config = SandboxConfig {
+        num_nodes: 4,
+        chain: cfg,
+        ..Default::default()
+    };
+
+    Sandbox::start(config, |mut s| {
+        s.poll();
+        for node in s.nodes.iter() {
+            assert_eq!(node.node_service.chain.height(), 1);
+        }
+
+        let mut starting_view_changes = 0;
+
+        for _ in 0..(s.cfg().blocks_in_epoch - 2) {
+            if s.nodes[0]
+                .node_service
+                .chain
+                .select_leader(starting_view_changes + 1)
+                != s.nodes[0].node_service.chain.leader()
+            {
+                break;
+            }
+            s.wait(s.cfg().tx_wait_timeout);
+            s.skip_micro_block();
+            starting_view_changes += 1;
+        }
+        let leader_pk = s.nodes[0].node_service.chain.leader();
+
+        s.wait(s.cfg().tx_wait_timeout);
+
+        s.poll();
+
+        let mut r = s.split(&[leader_pk]);
+        let leader = &mut r.parts.0.nodes[0];
+        let b1: Block = leader
+            .network_service
+            .get_broadcast(crate::SEALED_BLOCK_TOPIC);
+        let mut b2 = b1.clone();
+        // modify timestamp for block
+        match &mut b2 {
+            Block::MicroBlock(ref mut b) => {
+                b.base.timestamp += Duration::from_millis(1);
+                let block_hash = Hash::digest(&*b);
+                b.sig = pbc::sign_hash(&block_hash, &leader.node_service.keys.network_skey);
+            }
+            Block::MacroBlock(_) => unreachable!(),
+        }
+
+        for node in r.parts.1.iter_mut() {
+            node.network_service
+                .receive_broadcast(crate::SEALED_BLOCK_TOPIC, b1.clone());
+        }
+        r.parts
+            .1
+            .for_each(|node| assert_eq!(node.cheating_proofs.len(), 0));
+
+        for node in r.parts.1.iter_mut() {
+            node.network_service
+                .receive_broadcast(crate::SEALED_BLOCK_TOPIC, b2.clone());
+        }
+
+        r.parts.1.poll();
+        // each node should add proof of slashing into state.
+        r.parts
+            .1
+            .for_each(|node| assert_eq!(node.cheating_proofs.len(), 1));
+        r.wait(r.cfg().tx_wait_timeout);
+        r.parts.1.poll();
+
+        panic!();
+    });
+}
+
 fn precondition_2_different_leaderers(s: &mut Sandbox) {
     let mut ready = false;
     for _ in 0..(s.cfg().blocks_in_epoch - 2) {

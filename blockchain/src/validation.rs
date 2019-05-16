@@ -29,7 +29,7 @@ use crate::error::{BlockError, BlockchainError};
 use crate::multisignature::check_multi_signature;
 use crate::output::Output;
 use crate::transaction::{PaymentTransaction, RestakeTransaction, Transaction};
-use failure::Error;
+use failure::{bail, Error};
 use log::*;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
@@ -38,6 +38,7 @@ use stegos_crypto::bulletproofs::{fee_a, simple_commit};
 use stegos_crypto::curve1174::{ECp, Fr, G};
 use stegos_crypto::hash::{Hash, Hashable, Hasher};
 use stegos_crypto::{curve1174, pbc};
+use crate::{SlashingTransaction, confiscate_tx};
 
 pub type StakingBalance = HashMap<pbc::PublicKey, i64>;
 
@@ -302,6 +303,97 @@ impl RestakeTransaction {
     }
 }
 
+impl SlashingTransaction {
+    pub fn validate(&self, inputs:&[Output], blockchain: &Blockchain)
+        -> Result<StakingBalance, Error>
+    {
+        let ref leader = self.leader;
+        // validate proof
+        self.proof.validate(blockchain)?;
+
+        // recreate transaction
+        let tx = confiscate_tx(blockchain, leader, self.proof.clone())?;
+
+        // found incorrect formed slashing transaction.
+        if tx.txins != self.txins {
+            bail!("Incorrect txins list")
+        }
+        // found unhonest devided stake.
+        if tx.txouts != self.txouts {
+            bail!("Incorrect txouts list")
+        }
+
+        let tx_hash = Hash::digest(self);
+        //
+        // Calculate the pedersen commitment difference in order to check the monetary balance:
+        //
+        //     pedersen_commitment_diff = \sum C_i - \sum C_o - fee * A
+        //
+        // Calculate `P_eff` to validate transaction's signature:
+        //
+        //     P_eff = pedersen_commitment_diff + \sum P_i
+        //
+
+        let mut txin_sum = ECp::inf();
+        let mut txout_sum = ECp::inf();
+        let mut staking_balance: StakingBalance = HashMap::new();
+
+        // +\sum{C_i} for i in txins
+        let mut txins_set: HashSet<Hash> = HashSet::new();
+        for (txin_hash, txin) in self.txins.iter().zip(inputs) {
+            assert_eq!(Hash::digest(txin), *txin_hash);
+            if !txins_set.insert(*txin_hash) {
+                return Err(TransactionError::DuplicateInput(tx_hash, *txin_hash).into());
+            }
+            txin.validate()?;
+            let cmt = txin.pedersen_commitment()?;
+            txin_sum += cmt;
+            match txin {
+                Output::PaymentOutput(_o) => {}
+                Output::PublicPaymentOutput(_o) => {}
+                Output::StakeOutput(o) => {
+                    // Update staking balance.
+                    let stake = staking_balance.entry(o.validator).or_insert(0);
+                    *stake -= o.amount;
+                }
+            };
+        }
+        drop(txins_set);
+
+        // -\sum{C_o} for o in txouts
+        let mut txouts_set: HashSet<Hash> = HashSet::new();
+        for txout in &self.txouts {
+            let txout_hash = Hash::digest(txout);
+            if !txouts_set.insert(txout_hash) {
+                return Err(TransactionError::DuplicateOutput(tx_hash, txout_hash).into());
+            }
+            txout.validate()?;
+            let cmt = txout.pedersen_commitment()?;
+            txout_sum += cmt;
+            match txout {
+                Output::PaymentOutput(_o) => {}
+                Output::PublicPaymentOutput(_o) => {}
+                Output::StakeOutput(o) => {
+                    // Update staking balance.
+                    let stake = staking_balance.entry(o.validator).or_insert(0);
+                    *stake += o.amount;
+                }
+            };
+        }
+        drop(txouts_set);
+
+        // technically, this test is no longer needed since it has been
+        // absorbed into the signature check...
+        if txin_sum != txout_sum {
+            return Err(TransactionError::InvalidMonetaryBalance(tx_hash).into());
+        }
+
+        // Transaction is valid.
+        Ok(staking_balance)
+
+    }
+}
+
 impl Transaction {
     /// Validate the monetary balance and signature of transaction.
     ///
@@ -309,10 +401,14 @@ impl Transaction {
     ///
     /// * - `inputs` - UTXOs referred by self.body.txins, in the same order as in self.body.txins.
     ///
-    pub fn validate(&self, inputs: &[Output]) -> Result<StakingBalance, Error> {
+    pub fn validate(&self, inputs: &[Output], blockchain: &Blockchain) -> Result<StakingBalance, Error> {
         match self {
             Transaction::PaymentTransaction(tx) => tx.validate(inputs),
             Transaction::RestakeTransaction(tx) => tx.validate(inputs),
+            Transaction::SlashingTransaction(tx) => {
+                //TODO: check that leader correct
+                tx.validate(inputs, blockchain)
+            },
         }
     }
 }
@@ -426,7 +522,7 @@ impl Blockchain {
         }
 
         // Check the monetary balance, Bulletpoofs/amounts and signature.
-        let staking_balance = tx.validate(&inputs)?;
+        let staking_balance = tx.validate(&inputs, self)?;
 
         // Checks staking balance.
         self.validate_staking_balance(staking_balance.iter())?;

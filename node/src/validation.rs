@@ -94,7 +94,7 @@ pub(crate) fn validate_transaction(
     }
 
     // Check the monetary balance, Bulletpoofs/amounts and signature.
-    let staking_balance = tx.validate(&inputs)?;
+    let staking_balance = tx.validate(&inputs, &chain)?;
 
     // Checks staking balance.
     chain.validate_staking_balance(staking_balance.iter())?;

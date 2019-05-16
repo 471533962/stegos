@@ -33,6 +33,13 @@ message Output {
     }
 }
 
+message SlashingTransaction {
+    SlashingProof proof = 1;
+    stegos.crypto.SecurePublicKey leader = 2;
+    repeated stegos.crypto.Hash txins = 3;
+    repeated Output txouts = 4;
+}
+
 message PaymentTransaction {
     repeated stegos.crypto.Hash txins = 1;
     repeated Output txouts = 2;
@@ -51,6 +58,7 @@ message Transaction {
     oneof transaction {
         PaymentTransaction payment_transaction = 1;
         RestakeTransaction restake_transaction = 2;
+        SlashingTransaction slashing_transaction = 4;
     }
 }
 
@@ -113,4 +121,9 @@ message Block {
         MacroBlock macro_block = 1;
         MicroBlock micro_block = 2;
     }
+}
+
+message SlashingProof {
+    MicroBlock block1 = 1;
+    MicroBlock block2 = 2;
 }
