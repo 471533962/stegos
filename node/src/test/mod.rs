@@ -19,8 +19,6 @@
 // OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 // SOFTWARE.
 
-mod simple_tests;
-
 pub mod time;
 
 pub use stegos_network::loopback::Loopback;
@@ -204,9 +202,7 @@ impl NodeSandbox {
         let chain = Blockchain::testing(cfg.clone().into(), genesis, timestamp)
             .expect("Failed to create blockchain");
         let (mut node_service, node) = NodeService::new(cfg, chain, keychain, network).unwrap();
-        node_service
-            .handle_network_status(NETWORK_READY_TOKEN[..].to_vec())
-            .unwrap();
+        node_service.init().unwrap();
         Self {
             network_service,
             node,
