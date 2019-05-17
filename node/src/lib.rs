@@ -47,8 +47,8 @@ use protobuf::Message;
 use serde_derive::Deserialize;
 use serde_derive::Serialize;
 use std::collections::BTreeMap;
+use std::time::Instant;
 use std::time::SystemTime;
-use std::time::{Duration, Instant};
 use stegos_blockchain::*;
 use stegos_consensus::optimistic::{SealedViewChangeProof, ViewChangeCollector, ViewChangeMessage};
 use stegos_consensus::{BlockConsensus, BlockConsensusMessage};
@@ -212,27 +212,15 @@ pub enum NodeMessage {
     ChainLoaderMessage(UnicastMessage),
 }
 
-#[derive(Debug)]
-pub enum NodeTimerEvent {
-    MicroBlockProposeTimer,
-    MicroBlockViewChangeTimer,
-    MacroBlockProposeTimer,
-    MacroBlockViewChangeTimer,
-}
-
-enum BlockTimer {
-    None,
-    Propose(Delay),
-    ViewChange(Delay),
-}
-
 enum Validation {
     MicroBlockAuditor,
     MicroBlockValidator {
         /// Collector of view change.
         view_change_collector: ViewChangeCollector,
         /// Timer for proposing micro blocks && view changes.
-        block_timer: BlockTimer,
+        propose_timer: Option<Delay>,
+        /// Timer for sending view_changes..
+        view_change_timer: Option<Delay>,
         /// A queue of consensus message from the future epoch.
         // TODO: Resolve unknown blocks using requests-responses.
         future_consensus_messages: Vec<BlockConsensusMessage>,
@@ -242,7 +230,7 @@ enum Validation {
         /// pBFT consensus,
         consensus: BlockConsensus,
         /// Timer for sending view_changes..
-        block_timer: BlockTimer,
+        view_change_timer: Option<Delay>,
     },
 }
 use Validation::*;
@@ -1056,6 +1044,81 @@ impl NodeService {
     // Consensus
     //----------------------------------------------------------------------------------------------
 
+    fn on_micro_block_leader_changed(&mut self) {
+        let leader = self.chain.leader();
+        if leader == self.keys.network_pkey {
+            info!(
+                "I'm leader, collecting transactions for the next micro block: height={}, view_change={}, last_block={}",
+                self.chain.height(),
+                self.chain.view_change(),
+                self.chain.last_block_hash()
+            );
+            let deadline = if self.chain.view_change() == 0 {
+                // Wait some time to collect transactions.
+                clock::now() + self.cfg.tx_wait_timeout
+            } else {
+                // Propose a new block immediately on the next event loop iteration.
+                clock::now()
+            };
+            match &mut self.validation {
+                MicroBlockValidator { propose_timer, .. } => {
+                    std::mem::replace(propose_timer, Some(Delay::new(deadline)));
+                }
+                _ => panic!("Expected MicroBlockValidator State"),
+            }
+        } else {
+            info!("I'm validator, waiting for the next micro block: height={}, view_change={}, last_block={}, leader={}",
+                  self.chain.height(),
+                  self.chain.view_change(),
+                  self.chain.last_block_hash(),
+                  leader);
+            let deadline = clock::now() + self.cfg.micro_block_timeout;
+            match &mut self.validation {
+                MicroBlockValidator {
+                    view_change_timer, ..
+                } => {
+                    std::mem::replace(view_change_timer, Some(Delay::new(deadline)));
+                }
+                _ => panic!("Expected MicroBlockValidator State"),
+            }
+        };
+
+        task::current().notify();
+    }
+
+    fn on_macro_block_leader_changed(&mut self) -> Result<(), Error> {
+        let (view_change_timer, consensus) = match &mut self.validation {
+            MacroBlockValidator {
+                consensus,
+                view_change_timer,
+                ..
+            } => (view_change_timer, consensus),
+            _ => panic!("Expected MacroBlockValidator State"),
+        };
+
+        if consensus.is_leader() {
+            info!(
+                "I'm leader, proposing the next macro block: height={}, last_block={}",
+                self.chain.height(),
+                self.chain.last_block_hash()
+            );
+            return self.propose_macro_block();
+        } else {
+            info!(
+                "I'm validator, waiting for the next macro block: height={}, last_block={}, leader={}",
+                self.chain.height(),
+                self.chain.last_block_hash(),
+                consensus.leader(),
+            );
+
+            let relevant_round = 1 + consensus.round();
+            let deadline = clock::now() + relevant_round * self.cfg.macro_block_timeout;
+            std::mem::replace(view_change_timer, Some(Delay::new(deadline)));
+            task::current().notify();
+            Ok(())
+        }
+    }
+
     ///
     /// Change validation status after applying a new block or performing a view change.
     ///
@@ -1078,37 +1141,13 @@ impl NodeService {
                 self.keys.network_skey.clone(),
             );
 
-            let leader = self.chain.leader();
-            let block_timer = if leader == self.keys.network_pkey {
-                info!(
-                    "I'm leader, collecting transactions for the next micro block: height={}, view_change={}, last_block={}",
-                    self.chain.height(),
-                    self.chain.view_change(),
-                    self.chain.last_block_hash()
-                );
-                let delay = if self.chain.view_change() == 0 {
-                    // Wait some time to collect transactions.
-                    self.cfg.tx_wait_timeout
-                } else {
-                    // Propose a new block immediately on the next event loop iteration.
-                    Duration::from_secs(0)
-                };
-                BlockTimer::Propose(Delay::new(clock::now() + delay))
-            } else {
-                info!("I'm validator, waiting for the next micro block: height={}, view_change={}, last_block={}, leader={}",
-                      self.chain.height(),
-                      self.chain.view_change(),
-                      self.chain.last_block_hash(),
-                      leader);
-                BlockTimer::ViewChange(Delay::new(clock::now() + self.cfg.micro_block_timeout))
-            };
-
             self.validation = MicroBlockValidator {
                 view_change_collector,
-                block_timer,
+                propose_timer: None,
+                view_change_timer: None,
                 future_consensus_messages: Vec::new(),
             };
-            task::current().notify();
+            self.on_micro_block_leader_changed();
         } else {
             // Expected Macro Block.
             let prev = std::mem::replace(&mut self.validation, MacroBlockAuditor);
@@ -1130,30 +1169,11 @@ impl NodeService {
                 self.chain.validators().iter().cloned().collect(),
             );
 
-            let leader = self.chain.leader();
-            let block_timer = if leader == self.keys.network_pkey {
-                info!(
-                    "I'm leader, proposing the next macro block: height={}, last_block={}",
-                    self.chain.height(),
-                    self.chain.last_block_hash()
-                );
-                // Propose a new block on the next event loop iteration to avoid recursion.
-                BlockTimer::Propose(Delay::new(clock::now()))
-            } else {
-                info!(
-                    "I'm validator, waiting for the next macro block: height={}, last_block={}",
-                    self.chain.height(),
-                    self.chain.last_block_hash()
-                );
-                BlockTimer::ViewChange(Delay::new(clock::now() + self.cfg.macro_block_timeout))
-            };
-
             // Set validator state.
             self.validation = MacroBlockValidator {
                 consensus,
-                block_timer,
+                view_change_timer: None,
             };
-            task::current().notify();
 
             // Flush pending messages.
             if let MicroBlockValidator {
@@ -1167,6 +1187,8 @@ impl NodeService {
                     }
                 }
             }
+
+            self.on_macro_block_leader_changed()?;
         }
 
         Ok(())
@@ -1315,13 +1337,7 @@ impl NodeService {
         // Go to the next round.
         consensus.next_round();
         metrics::KEY_BLOCK_VIEW_CHANGES.inc();
-        // Reset timer.
-        let relevant_round = 1 + consensus.round();
-        if let MacroBlockValidator { block_timer, .. } = &mut self.validation {
-            let delay = Delay::new(clock::now() + relevant_round * self.cfg.macro_block_timeout);
-            std::mem::replace(block_timer, BlockTimer::ViewChange(delay));
-            task::current().notify();
-        }
+        self.on_macro_block_leader_changed()?;
 
         // Try to sync with the network.
         metrics::SYNCHRONIZED.set(0);
@@ -1366,8 +1382,8 @@ impl NodeService {
             self.chain
                 .set_view_change(self.chain.view_change() + 1, proof);
 
-            // Change validator.
-            self.update_validation_status()?;
+            // Change leader.
+            self.on_micro_block_leader_changed();
         };
 
         Ok(())
@@ -1385,18 +1401,18 @@ impl NodeService {
         );
 
         // Check state.
-        let (view_change_collector, block_timer) = match &mut self.validation {
+        let (view_change_collector, view_change_timer) = match &mut self.validation {
             MicroBlockValidator {
                 view_change_collector,
-                block_timer,
+                view_change_timer,
                 ..
-            } => (view_change_collector, block_timer),
+            } => (view_change_collector, view_change_timer),
             _ => panic!("Invalid state"),
         };
 
         // Update timer.
         let delay = Delay::new(clock::now() + self.cfg.micro_block_timeout);
-        std::mem::replace(block_timer, BlockTimer::ViewChange(delay));
+        std::mem::replace(view_change_timer, Some(delay));
         task::current().notify();
 
         // Send a view_change message.
@@ -1498,46 +1514,40 @@ impl NodeService {
     /// ## Panics:
     /// If some of intevals return None.
     /// If some timer fails.
-    pub fn poll_timers(&mut self) -> Async<NodeTimerEvent> {
+    pub fn poll_timers(&mut self) -> Result<(), Error> {
         match &mut self.validation {
             MicroBlockAuditor => {}
-            MicroBlockValidator { block_timer, .. } => match block_timer {
-                BlockTimer::None => {}
-                BlockTimer::Propose(timer) => match timer.poll().unwrap() {
-                    Async::Ready(()) => {
-                        std::mem::replace(block_timer, BlockTimer::None);
-                        return Async::Ready(NodeTimerEvent::MicroBlockProposeTimer);
+            MicroBlockValidator {
+                propose_timer,
+                view_change_timer,
+                ..
+            } => {
+                if let Some(mut timer) = std::mem::replace(propose_timer, None) {
+                    match timer.poll().unwrap() {
+                        Async::Ready(()) => return self.create_micro_block(),
+                        Async::NotReady => {}
                     }
-                    Async::NotReady => {}
-                },
-                BlockTimer::ViewChange(timer) => match timer.poll().unwrap() {
-                    Async::Ready(()) => {
-                        std::mem::replace(block_timer, BlockTimer::None);
-                        return Async::Ready(NodeTimerEvent::MicroBlockViewChangeTimer);
+                } else if let Some(mut timer) = std::mem::replace(view_change_timer, None) {
+                    match timer.poll().unwrap() {
+                        Async::Ready(()) => return self.handle_micro_block_viewchange_timer(),
+                        Async::NotReady => {}
                     }
-                    Async::NotReady => {}
-                },
-            },
+                }
+            }
             MacroBlockAuditor => {}
-            MacroBlockValidator { block_timer, .. } => match block_timer {
-                BlockTimer::None => {}
-                BlockTimer::Propose(timer) => match timer.poll().unwrap() {
-                    Async::Ready(()) => {
-                        std::mem::replace(block_timer, BlockTimer::None);
-                        return Async::Ready(NodeTimerEvent::MacroBlockProposeTimer);
+            MacroBlockValidator {
+                view_change_timer, ..
+            } => {
+                if let Some(mut timer) = std::mem::replace(view_change_timer, None) {
+                    match timer.poll().unwrap() {
+                        Async::Ready(()) => return self.handle_macro_block_viewchange_timer(),
+                        Async::NotReady => {}
                     }
-                    Async::NotReady => {}
-                },
-                BlockTimer::ViewChange(timer) => match timer.poll().unwrap() {
-                    Async::Ready(()) => {
-                        std::mem::replace(block_timer, BlockTimer::None);
-                        return Async::Ready(NodeTimerEvent::MacroBlockViewChangeTimer);
-                    }
-                    Async::NotReady => {}
-                },
-            },
+                }
+            }
         }
-        return Async::NotReady;
+
+        return Ok(());
     }
 }
 
@@ -1547,20 +1557,8 @@ impl Future for NodeService {
     type Error = ();
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        while let Async::Ready(item) = self.poll_timers() {
-            let result = match item {
-                NodeTimerEvent::MicroBlockProposeTimer => self.create_micro_block(),
-                NodeTimerEvent::MicroBlockViewChangeTimer => {
-                    self.handle_micro_block_viewchange_timer()
-                }
-                NodeTimerEvent::MacroBlockProposeTimer => self.propose_macro_block(),
-                NodeTimerEvent::MacroBlockViewChangeTimer => {
-                    self.handle_macro_block_viewchange_timer()
-                }
-            };
-            if let Err(e) = result {
-                error!("Error: {}", e);
-            }
+        if let Err(e) = self.poll_timers() {
+            error!("Error: {}", e);
         }
 
         loop {
